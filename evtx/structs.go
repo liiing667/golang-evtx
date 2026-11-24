@@ -606,7 +606,9 @@ func (ti *TemplateInstance) NodeToGoEvtx(n *Node) GoEvtxMap {
 					}
 				}
 			default:
-				m["Value"] = ti.ElementToGoEvtx(n.Element[0])
+				if ge != nil {
+					m["Value"] = ge
+				}
 			}
 		}
 		// n.Start can be NULL in  carving mode

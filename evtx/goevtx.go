@@ -69,6 +69,10 @@ func (pg *GoEvtxMap) GetMap(path *GoEvtxPath) (*GoEvtxMap, error) {
 				p := ge.(GoEvtxMap)
 				np := (*path)[1:]
 				return p.GetMap(&np)
+			case map[string]interface{}:
+				p := GoEvtxMap(ge.(map[string]interface{}))
+				np := (*path)[1:]
+				return p.GetMap(&np)
 			}
 		}
 	}
@@ -164,15 +168,22 @@ func (pg *GoEvtxMap) GetStringStrict(path *GoEvtxPath) string {
 // @path : path to search for
 // return (bool, error)
 func (pg *GoEvtxMap) GetBool(path *GoEvtxPath) (bool, error) {
-	s, err := pg.GetString(path)
-	if err != nil {
-		return false, &ErrEvtxEltNotFound{*path}
-	}
-	b, err := strconv.ParseBool(s)
+	e, err := pg.Get(path)
 	if err != nil {
 		return false, err
 	}
-	return b, err
+	switch v := (*e).(type) {
+	case bool:
+		return v, nil
+	case string:
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, err
+		}
+		return b, nil
+	default:
+		return false, fmt.Errorf("Bad type expect bool got %T", *e)
+	}
 }
 
 func (pg *GoEvtxMap) GetBoolStrict(path *GoEvtxPath) bool {
@@ -187,15 +198,30 @@ func (pg *GoEvtxMap) GetBoolStrict(path *GoEvtxPath) bool {
 // @path : path to search for
 // return int64, error
 func (pg *GoEvtxMap) GetInt(path *GoEvtxPath) (int64, error) {
-	s, err := pg.GetString(path)
-	if err != nil {
-		return 0, &ErrEvtxEltNotFound{*path}
-	}
-	i, err := strconv.ParseInt(s, 0, 64)
+	e, err := pg.Get(path)
 	if err != nil {
 		return 0, err
 	}
-	return i, nil
+	switch v := (*e).(type) {
+	case int64:
+		return v, nil
+	case int:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case string:
+		i, err := strconv.ParseInt(v, 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		return i, nil
+	default:
+		return 0, fmt.Errorf("Bad type expect int got %T", *e)
+	}
 }
 
 func (pg *GoEvtxMap) GetIntStrict(path *GoEvtxPath) int64 {
@@ -210,15 +236,30 @@ func (pg *GoEvtxMap) GetIntStrict(path *GoEvtxPath) int64 {
 // @path : path to search for
 // return uint64
 func (pg *GoEvtxMap) GetUint(path *GoEvtxPath) (uint64, error) {
-	s, err := pg.GetString(path)
-	if err != nil {
-		return 0, &ErrEvtxEltNotFound{*path}
-	}
-	u, err := strconv.ParseUint(s, 0, 64)
+	e, err := pg.Get(path)
 	if err != nil {
 		return 0, err
 	}
-	return u, nil
+	switch v := (*e).(type) {
+	case uint64:
+		return v, nil
+	case uint:
+		return uint64(v), nil
+	case uint8:
+		return uint64(v), nil
+	case uint16:
+		return uint64(v), nil
+	case uint32:
+		return uint64(v), nil
+	case string:
+		u, err := strconv.ParseUint(v, 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		return u, nil
+	default:
+		return 0, fmt.Errorf("Bad type expect uint got %T", *e)
+	}
 }
 
 func (pg *GoEvtxMap) GetUintStrict(path *GoEvtxPath) uint64 {
@@ -235,7 +276,7 @@ func (pg *GoEvtxMap) GetUintStrict(path *GoEvtxPath) uint64 {
 func (pg *GoEvtxMap) GetTime(path *GoEvtxPath) (time.Time, error) {
 	t, err := pg.Get(path)
 	if err != nil {
-		return time.Time{}, &ErrEvtxEltNotFound{*path}
+		return time.Time{}, err
 	}
 	// If the value was extracted from raw BinXML (not a template) it may happen
 	// that the value stored at path is a string since in raw BinXML everything
@@ -303,15 +344,18 @@ func (pg *GoEvtxMap) UserID() (userID string, ok bool) {
 }
 
 func (pg *GoEvtxMap) Before(t time.Time) bool {
-	return pg.GetTimeStrict(&SystemTimePath).Before(t)
+	got, err := pg.GetTime(&SystemTimePath)
+	return err == nil && got.Before(t)
 }
 
 func (pg *GoEvtxMap) After(t time.Time) bool {
-	return pg.GetTimeStrict(&SystemTimePath).After(t)
+	got, err := pg.GetTime(&SystemTimePath)
+	return err == nil && got.After(t)
 }
 
 func (pg *GoEvtxMap) At(t time.Time) bool {
-	return pg.GetTimeStrict(&SystemTimePath).Equal(t)
+	got, err := pg.GetTime(&SystemTimePath)
+	return err == nil && got.Equal(t)
 }
 
 func (pg *GoEvtxMap) Between(t1, t2 time.Time) bool {
@@ -363,7 +407,43 @@ func (pg *GoEvtxMap) RegexMatch(path *GoEvtxPath, pattern *regexp.Regexp) bool {
 // @eids : EventID numbers to test against
 // return bool
 func (pg *GoEvtxMap) IsEventID(eids ...interface{}) bool {
-	return pg.AnyEqual(&EventIDPath, eids)
+	eid, err := pg.GetInt(&EventIDPath)
+	if err != nil {
+		eid, err = pg.GetInt(&EventIDPath2)
+	}
+	if err != nil {
+		return false
+	}
+	for _, candidate := range eids {
+		switch v := candidate.(type) {
+		case int8:
+			if int64(v) == eid {
+				return true
+			}
+		case int16:
+			if int64(v) == eid {
+				return true
+			}
+		case int32:
+			if int64(v) == eid {
+				return true
+			}
+		case int64:
+			if v == eid {
+				return true
+			}
+		case int:
+			if int64(v) == eid {
+				return true
+			}
+		case string:
+			parsed, err := strconv.ParseInt(v, 0, 64)
+			if err == nil && parsed == eid {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Set sets a new GoEvtxElement at path

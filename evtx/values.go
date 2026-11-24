@@ -78,7 +78,7 @@ func (ValueNull) Value() interface{} {
 }
 
 func (ValueNull) Repr() interface{} {
-	return "NULL"
+	return nil
 }
 
 ////////////////////////////////// Int8 ///////////////////////////////////////
@@ -100,7 +100,7 @@ func (i *ValueInt8) Value() interface{} {
 }
 
 func (i *ValueInt8) Repr() interface{} {
-	return i.String()
+	return i.value
 }
 
 ////////////////////////////////// UInt8 ///////////////////////////////////////
@@ -122,7 +122,7 @@ func (u *ValueUInt8) Value() interface{} {
 }
 
 func (u *ValueUInt8) Repr() interface{} {
-	return u.String()
+	return u.value
 }
 
 ////////////////////////////////// Int16 ///////////////////////////////////////
@@ -144,7 +144,7 @@ func (i *ValueInt16) Value() interface{} {
 }
 
 func (i *ValueInt16) Repr() interface{} {
-	return i.String()
+	return i.value
 }
 
 ////////////////////////////////// UInt16 //////////////////////////////////////
@@ -166,7 +166,7 @@ func (u *ValueUInt16) Value() interface{} {
 }
 
 func (u *ValueUInt16) Repr() interface{} {
-	return u.String()
+	return u.value
 }
 
 ////////////////////////////////// Int32 //////////////////////////////////////
@@ -188,7 +188,7 @@ func (i *ValueInt32) Value() interface{} {
 }
 
 func (i *ValueInt32) Repr() interface{} {
-	return i.String()
+	return i.value
 }
 
 ////////////////////////////////// UInt32 //////////////////////////////////////
@@ -215,7 +215,7 @@ func (u *ValueUInt32) Value() interface{} {
 }
 
 func (u *ValueUInt32) Repr() interface{} {
-	return u.String()
+	return u.value
 }
 
 func (i *ValueHexInt32) String() string {
@@ -223,11 +223,11 @@ func (i *ValueHexInt32) String() string {
 }
 
 func (i *ValueHexInt32) Value() interface{} {
-	return i.Value()
+	return i.value
 }
 
 func (i *ValueHexInt32) Repr() interface{} {
-	return i.String()
+	return i.value
 }
 
 ////////////////////////////////// Int32 //////////////////////////////////////
@@ -249,7 +249,7 @@ func (i *ValueInt64) Value() interface{} {
 }
 
 func (i *ValueInt64) Repr() interface{} {
-	return i.String()
+	return i.value
 }
 
 ////////////////////////////////// UInt64 //////////////////////////////////////
@@ -277,7 +277,7 @@ func (u *ValueUInt64) Value() interface{} {
 }
 
 func (u *ValueUInt64) Repr() interface{} {
-	return u.String()
+	return u.value
 }
 
 func (i *ValueHexInt64) String() string {
@@ -285,11 +285,11 @@ func (i *ValueHexInt64) String() string {
 }
 
 func (i *ValueHexInt64) Value() interface{} {
-	return i.Value()
+	return i.value
 }
 
 func (i *ValueHexInt64) Repr() interface{} {
-	return i.String()
+	return i.value
 }
 
 ///////////////////////////////// Real32Type //////////////////////////////////
@@ -601,7 +601,7 @@ func (b *ValueBool) String() string {
 }
 
 func (b *ValueBool) Repr() interface{} {
-	return fmt.Sprintf("%t", b.Value())
+	return b.Value()
 }
 
 ///////////////////////////////// ValueBinary //////////////////////////////////
