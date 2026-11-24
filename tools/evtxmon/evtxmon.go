@@ -56,6 +56,8 @@ var (
 	statsFlag       bool
 	debug           bool
 	monitorExisting bool
+	timelineWarn    bool
+	timelineStrict  bool
 	filters         args.ListIntVar
 	duration        DurationArg
 	output          string
@@ -191,12 +193,30 @@ func main() {
 	flag.BoolVar(&statsFlag, "s", statsFlag, "Outputs stats about events processed")
 	flag.BoolVar(&debug, "d", debug, "Enable debug messages")
 	flag.BoolVar(&monitorExisting, "e", monitorExisting, "Return also already existing events")
+	flag.BoolVar(&timelineWarn, "timeline-warn", timelineWarn, "Enable timeline guard: log an explicit warning when events go backwards in (EventRecordID, TimeCreated) but keep publishing them")
+	flag.BoolVar(&timelineStrict, "timeline-strict", timelineStrict, "Enable timeline guard in fail-closed mode: drop out-of-order events (e.g. replayed after a file reopen) with an explicit warning; use -timeline-abort to stop monitoring instead")
+	timelineAbort := flag.Bool("timeline-abort", false, "Enable timeline guard in abort mode: stop monitoring as soon as the (EventRecordID, TimeCreated) timeline goes backwards")
 
 	flag.Parse()
 
 	// set debug mode
 	if debug {
 		log.InitLogger(log.LDebug)
+	}
+
+	// Timeline guard policies are mutually exclusive.
+	timelineModes := 0
+	if timelineWarn {
+		timelineModes++
+	}
+	if timelineStrict {
+		timelineModes++
+	}
+	if *timelineAbort {
+		timelineModes++
+	}
+	if timelineModes > 1 {
+		log.Abort(ExitFailure, fmt.Errorf("-timeline-warn, -timeline-strict and -timeline-abort are mutually exclusive"))
 	}
 
 	stats := NewStats(filters...)
@@ -243,6 +263,24 @@ func main() {
 		ef, err := evtx.Open(evtxfile)
 		if err != nil && err != evtx.ErrDirtyFile {
 			log.Abort(ExitFailure, err)
+		}
+
+		// Bind the public timeline to both the event timestamp and the record
+		// identity (EventRecordID). When the EVTX file is reopened and events
+		// are replayed in disk order, both attributes go backwards: the guard
+		// either explicitly warns, drops the offending events (fail closed) or
+		// aborts the monitoring depending on the selected policy. Equal
+		// timestamps and monotonically increasing logs are always preserved.
+		switch {
+		case *timelineAbort:
+			ef.EnableTimelineGuard(evtx.ModeAbort)
+			log.Infof("Timeline guard enabled in abort mode")
+		case timelineStrict:
+			ef.EnableTimelineGuard(evtx.ModeFailClosed)
+			log.Infof("Timeline guard enabled in fail-closed mode")
+		case timelineWarn:
+			ef.EnableTimelineGuard(evtx.ModeWarn)
+			log.Infof("Timeline guard enabled in warn mode")
 		}
 
 		if statsFlag {

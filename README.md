@@ -125,8 +125,69 @@ Usage: evtxmon [OPTIONS] EVTX-FILE
   -s	Outputs stats about events processed
   -t value
     	Timeout for the test
+  -timeline-abort
+    	Enable timeline guard in abort mode: stop monitoring as soon as the (EventRecordID, TimeCreated) timeline goes backwards
+  -timeline-strict
+    	Enable timeline guard in fail-closed mode: drop out-of-order events (e.g. replayed after a file reopen) with an explicit warning
+  -timeline-warn
+    	Enable timeline guard: log an explicit warning when events go backwards in (EventRecordID, TimeCreated) but keep publishing them
   -w string
     	Write monitored events to output file
+```
+
+# Timeline guard
+
+When an EVTX file is reopened (service restart, file rotation, ...) the
+consumer may replay already written events in **disk order**. Those events can
+carry `TimeCreated` timestamps and `EventRecordID` values that go backwards
+compared to the events already published, which silently corrupts the public
+timeline of downstream consumers.
+
+The library ships with an optional `TimelineGuard` (`evtx/timeline.go`) which
+binds the public timeline to both identities of every event:
+
+- the record identity: `/Event/System/EventRecordID`
+- the event timestamp: `/Event/System/TimeCreated/SystemTime`
+
+The guard considers the timeline healthy as long as both attributes are
+monotonically non decreasing:
+
+- equal timestamps are always legal (several events can share the same
+  filetime tick) and never raise an alert;
+- strictly increasing record ids and timestamps always pass through;
+- an exact re-read of the same event (same record id, same timestamp) is
+  tolerated;
+- a simultaneous regression of the record id and the timestamp is reported as
+  a timeline rewind (`ErrTimelineRewind`), the unmistakable signature of a
+  file reopen replaying events in disk order;
+- isolated regressions of the record id, of the timestamp, or a record id
+  reused with a different timestamp are reported as distinct anomalies
+  (`ErrEventRecordRegression`, `ErrTimeRegression`, `ErrDuplicateRecord`).
+
+Three policies are available through `File.EnableTimelineGuard(mode)`:
+
+- `evtx.ModeWarn`: an explicit warning is logged for every anomaly, the event
+  is still published (closest to the historical behavior);
+- `evtx.ModeFailClosed`: offending events are dropped after an explicit
+  warning so that no out-of-order event ever reaches the consumers, while the
+  monitoring stream keeps flowing;
+- `evtx.ModeAbort`: monitoring stops on the first anomaly.
+
+When the guard is not explicitly enabled, the library behavior is unchanged.
+The same guard can also be used standalone:
+
+```go
+guard := evtx.NewTimelineGuard(evtx.ModeFailClosed)
+for e := range ef.MonitorEvents(stop) {
+    if anomaly, abort := guard.CheckEvent(e); anomaly != nil {
+        // anomaly.Kind is one of the evtx.Err* sentinel errors
+        if abort {
+            close(stop)
+        }
+        continue // fail closed at the consumer level
+    }
+    publish(e)
+}
 ```
 
 # Known Issues

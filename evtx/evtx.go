@@ -106,6 +106,10 @@ type File struct {
 	Header          FileHeader
 	file            io.ReadSeeker
 	monitorExisting bool
+	// guard, when set, enforces the ordering of the public timeline by binding
+	// TimeCreated and EventRecordID on every event emitted by MonitorEvents.
+	// See TimelineGuard and EnableTimelineGuard for the available policies.
+	guard *TimelineGuard
 }
 
 // New EvtxFile structure initialized from an open buffer
@@ -150,6 +154,35 @@ func OpenDirty(filepath string) (ef File, err error) {
 // return already existing events when using MonitorEvents
 func (ef *File) SetMonitorExisting(value bool) {
 	ef.monitorExisting = value
+}
+
+// EnableTimelineGuard attaches a TimelineGuard to the File so that
+// MonitorEvents validates every published event against the timeline defined by
+// the couple (EventRecordID, TimeCreated). mode selects the policy applied on
+// ordering anomalies:
+//
+//   - ModeWarn: explicit warning logged, event still delivered (default
+//     behavior of the library before this option existed);
+//   - ModeFailClosed: offending events are dropped from the output channel
+//     after an explicit warning, the stream keeps flowing;
+//   - ModeAbort: monitoring stops (channel closed) on the first anomaly.
+//
+// Legitimate equal timestamps and monotonically increasing logs are always
+// preserved. The guard mainly catches the file reopen case where events are
+// replayed in disk order with regressing timestamps and record identifiers.
+func (ef *File) EnableTimelineGuard(mode int) *TimelineGuard {
+	ef.Lock()
+	defer ef.Unlock()
+	ef.guard = NewTimelineGuard(mode)
+	return ef.guard
+}
+
+// TimelineGuard returns the TimelineGuard attached to the File, nil if
+// EnableTimelineGuard has never been called.
+func (ef *File) TimelineGuard() *TimelineGuard {
+	ef.Lock()
+	defer ef.Unlock()
+	return ef.guard
 }
 
 // ParseFileHeader parses a the file header of the file structure and modifies
@@ -469,6 +502,10 @@ func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan
 	go func() {
 		defer close(cgem)
 		chanQueue := make(chan (chan *GoEvtxMap), jobs)
+		// Take a local snapshot of the guard: MonitorEvents owns the publishing
+		// loop and no other goroutine is expected to toggle the guard while
+		// monitoring is active.
+		guard := ef.guard
 		go func() {
 			defer close(chanQueue)
 			// this chan ends only when value is put into stop
@@ -484,6 +521,20 @@ func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan
 		}()
 		for ec := range chanQueue {
 			for event := range ec {
+				if guard != nil {
+					anomaly, mustAbort := guard.CheckEvent(event)
+					if anomaly != nil {
+						switch guard.Mode() {
+						case ModeFailClosed:
+							// Fail closed: the out-of-order event never reaches
+							// the consumers but the stream stays alive.
+							continue
+						}
+					}
+					if mustAbort {
+						return
+					}
+				}
 				cgem <- event
 			}
 		}
