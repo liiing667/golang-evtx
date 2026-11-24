@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/0xrawsec/golang-utils/encoding"
 	"github.com/0xrawsec/golang-utils/log"
 )
 
@@ -117,16 +118,30 @@ func Parse(reader io.ReadSeeker, c *Chunk, tiFlag bool) (Element, error) {
 			if err != nil {
 				return nil, err
 			}
-			if t, ok := c.TemplateTable[offset]; ok {
-				// We have now to fix the offset to continue to read
-				err = ti.ParseTemplateDefinitionHeader(reader)
-				if err != nil {
-					return nil, err
-				}
-				// Only the definition is valid, not the data
+			// We have now to fix the offset to continue to read
+			err = ti.ParseTemplateDefinitionHeader(reader)
+			if err != nil {
+				return nil, err
+			}
+			// Read the content identity (TemplateID) of the referenced
+			// definition. The TemplateID is located 4 bytes after the
+			// start of the template definition data (after Unknown3).
+			headerEnd := BackupSeeker(reader)
+			GoToSeeker(reader, int64(offset)+4)
+			var templateID TemplateID
+			if err = encoding.Unmarshal(reader, &templateID, Endianness); err != nil {
+				return nil, err
+			}
+			GoToSeeker(reader, headerEnd)
+			// A cached definition is reused only if it is bound to the
+			// same chunk/offset and matches the content identity, or if
+			// an identical template (same TemplateID) has already been
+			// parsed anywhere else (normal cross chunk sharing).
+			if t, ok := c.lookupTemplate(offset, templateID); ok {
+				// Only the definition is valid, not the data
 				ti.Definition.Data = t
 				// We jump over the template definition data if needed
-				if int64(offset) == BackupSeeker(reader) {
+				if int64(offset) == headerEnd {
 					// We patch offset to jump off to arrive after definition data size
 					RelGoToSeeker(reader, int64(ti.Definition.Data.Size)+24)
 				}
@@ -137,12 +152,39 @@ func Parse(reader io.ReadSeeker, c *Chunk, tiFlag bool) (Element, error) {
 				}
 				return &ti, nil
 			}
+			// Cache miss or content identity mismatch: the definition has
+			// to be parsed from the current chunk. Parse the rest of the
+			// definition (header is already parsed).
+			// The definition data may be located elsewhere in the chunk.
+			if int64(offset) != headerEnd {
+				GoToSeeker(reader, int64(offset))
+			}
+			err = ti.Definition.Data.Parse(reader)
+			// We have to come back to parse the instance data which are
+			// located after the definition header.
+			if int64(offset) != headerEnd {
+				GoToSeeker(reader, headerEnd)
+			}
+			if err == nil {
+				err = ti.Data.Parse(reader)
+			}
+			if err != nil {
+				return nil, err
+			}
+			// Update both the legacy table and the public template cache
+			c.TemplateTable[ti.Definition.Header.DataOffset] = ti.Definition.Data
+			c.cacheTemplate(ti.Definition.Header.DataOffset, ti.Definition.Data)
+			checkParsingError(err, reader, &ti)
+			return &ti, nil
 		}
 		// We have to parse the template since it cannot be found the template table
 		err = ti.Parse(reader)
 		if c != nil {
 			// Update template table
 			c.TemplateTable[ti.Definition.Header.DataOffset] = ti.Definition.Data
+			// Bind the freshly parsed definition to the chunk, the offset
+			// and its content identity in the public template cache.
+			c.cacheTemplate(ti.Definition.Header.DataOffset, ti.Definition.Data)
 		}
 		checkParsingError(err, reader, &ti)
 		return &ti, err

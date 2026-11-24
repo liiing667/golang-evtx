@@ -99,12 +99,33 @@ type Chunk struct {
 	TemplateTable TemplateTable
 	EventOffsets  []int32
 	Data          []byte
+	// Templates is the cache in which the template definitions of the chunk
+	// are stored. Entries are bound to the chunk offset and the chunk
+	// relative offset of the template definition and verified against the
+	// template content identity (TemplateID). It defaults to the shared
+	// DefaultTemplateCache so that identical templates can still be shared
+	// across chunks.
+	Templates *TemplateCache
 }
 
 // NewChunk initialize and returns a new Chunk structure
 // return Chunk
 func NewChunk() Chunk {
-	return Chunk{StringTable: make(ChunkStringTable, 0), TemplateTable: make(TemplateTable, 0)}
+	return Chunk{
+		StringTable:   make(ChunkStringTable, 0),
+		TemplateTable: make(TemplateTable, 0),
+		Templates:     DefaultTemplateCache(),
+	}
+}
+
+// SetTemplateCache configures the TemplateCache used to store and lookup the
+// template definitions of the chunk. Passing nil restores the shared
+// DefaultTemplateCache.
+func (c *Chunk) SetTemplateCache(tc *TemplateCache) {
+	if tc == nil {
+		tc = DefaultTemplateCache()
+	}
+	c.Templates = tc
 }
 
 // ParseChunkHeader parses a chunk header at offset
@@ -167,10 +188,60 @@ func (c *Chunk) ParseTemplateTable(reader io.ReadSeeker) error {
 				return err
 			}
 			c.TemplateTable[templateDataOffset] = tdd
+			// Bind the parsed definition to both its physical location
+			// (chunk + relative offset) and its content identity in the
+			// public template cache.
+			c.cacheTemplate(templateDataOffset, tdd)
 			GoToSeeker(reader, backup)
 		}
 	}
 	return nil
+}
+
+// cacheTemplate stores a parsed template definition data both in the legacy
+// per chunk TemplateTable and in the TemplateCache where it is bound to the
+// chunk offset, the chunk relative data offset and the template TemplateID.
+func (c *Chunk) cacheTemplate(dataOffset int32, tdd TemplateDefinitionData) {
+	if c.Templates == nil {
+		c.Templates = DefaultTemplateCache()
+	}
+	c.Templates.Store(c.Offset, dataOffset, tdd)
+}
+
+// lookupTemplate returns the template definition data that must be used for
+// a template instance referencing a definition at the given chunk relative
+// offset.
+//
+// The lookup enforces the binding of cached entries to the chunk, the offset
+// and the template content identity (TemplateID):
+//   - an entry cached for the same chunk and offset is reused only when its
+//     TemplateID matches the one of the referenced definition,
+//   - an entry cached for another location but with the same TemplateID is
+//     reused as well since identical TemplateIDs guarantee identical
+//     definitions, which keeps normal cross chunk template sharing working,
+//   - otherwise nothing is returned and the definition has to be parsed.
+func (c *Chunk) lookupTemplate(dataOffset int32, id TemplateID) (TemplateDefinitionData, bool) {
+	if c.Templates == nil {
+		c.Templates = DefaultTemplateCache()
+	}
+	// Same physical location: the entry is valid only if the content
+	// identity matches. This is the guard against stale templates when the
+	// same relative offset in another chunk points to a different
+	// definition.
+	if ct, ok := c.Templates.Lookup(c.Offset, dataOffset); ok && bytes.Equal(ct.ID[:], id[:]) {
+		return ct.Data, true
+	}
+	// Same content identity anywhere in the file: definitions with the same
+	// TemplateID are equivalent, the template can safely be shared across
+	// chunks.
+	if tdd, ok := c.Templates.LookupByID(id); ok {
+		// Register the new physical location so that the definition stays
+		// addressable by chunk and offset while sharing the already parsed
+		// content through its content identity.
+		c.Templates.Store(c.Offset, dataOffset, tdd)
+		return tdd, true
+	}
+	return TemplateDefinitionData{}, false
 }
 
 // ParseEventOffsets parses the offsets at which we can find the events and
