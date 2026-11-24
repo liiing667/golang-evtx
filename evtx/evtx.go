@@ -105,6 +105,7 @@ type File struct {
 	sync.Mutex      // We need it if we want to parse (read) chunks in several threads
 	Header          FileHeader
 	file            io.ReadSeeker
+	path            string
 	monitorExisting bool
 }
 
@@ -113,6 +114,12 @@ type File struct {
 // return File : File structure initialized
 func New(r io.ReadSeeker) (ef File, err error) {
 	ef.file = r
+	// A reader constructed by Open is an *os.File. Remember its path so that
+	// an explicitly closed File can be reopened from the committed file state
+	// instead of trying to reuse a dead descriptor/cursor.
+	if f, ok := r.(*os.File); ok {
+		ef.path = f.Name()
+	}
 	ef.ParseFileHeader()
 	return
 }
@@ -130,10 +137,60 @@ func Open(filepath string) (ef File, err error) {
 	if err != nil {
 		return
 	}
+	ef.path = filepath
 
 	err = ef.Header.Verify()
 
 	return
+}
+
+// Reset discards the in-memory parse position and reloads the file header from
+// the underlying reader. It does not close or reopen an os.File; use Reopen
+// when the path points to a replaced file or when the file has already been
+// closed.
+func (ef *File) Reset() error {
+	ef.Lock()
+	defer ef.Unlock()
+	return ef.resetLocked()
+}
+
+// Reopen discards every inherited parse cursor and parser cache reference and
+// rebuilds the File from the durable EVTX state.
+//
+// Files created with Open, or New from an *os.File, are opened again by path.
+// Reader based Files without a path are rewound to their first byte. A reopen
+// therefore observes the currently committed header/chunks rather than the
+// position left by a previous event traversal.
+func (ef *File) Reopen() error {
+	ef.Lock()
+
+	if ef.path != "" {
+		f, err := os.Open(ef.path)
+		if err != nil {
+			ef.Unlock()
+			return err
+		}
+
+		old := ef.file
+		ef.file = f
+		if closer, ok := old.(io.Closer); ok && old != nil {
+			// The caller may already have closed the old handle. Closing it
+			// again only returns an error which is irrelevant to the new,
+			// successfully opened handle.
+			_ = closer.Close()
+		}
+	}
+
+	err := ef.resetLocked()
+	header := ef.Header
+	ef.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// Keep Open/Reopen admission semantics identical. OpenDirty can recover
+	// ErrDirtyFile exactly as it does after Open.
+	return header.Verify()
 }
 
 // OpenDirty is a wrapper around Open to handle the case
@@ -158,11 +215,35 @@ func (ef *File) ParseFileHeader() {
 	ef.Lock()
 	defer ef.Unlock()
 
-	GoToSeeker(ef.file, 0)
-	err := encoding.Unmarshal(ef.file, &ef.Header, Endianness)
-	if err != nil {
+	if err := ef.resetLocked(); err != nil {
 		panic(err)
 	}
+}
+
+// HeaderSnapshot returns the committed file header currently associated with
+// the File. Event scans use such a snapshot so a refresh or concurrent monitor
+// loop cannot change chunk geometry while a traversal is being scheduled.
+func (ef *File) HeaderSnapshot() FileHeader {
+	ef.Lock()
+	defer ef.Unlock()
+	return ef.Header
+}
+
+func (ef *File) resetLocked() error {
+	if ef.file == nil {
+		return io.ErrClosedPipe
+	}
+
+	if _, err := ef.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	// Do not retain ChunkCount/NextRecordID/... values from an older log
+	// generation. Unmarshal overwrites the structure, but starting from a zero
+	// value also makes short-read/error paths impossible to mistake for valid
+	// committed state.
+	ef.Header = FileHeader{}
+	return encoding.Unmarshal(ef.file, &ef.Header, Endianness)
 }
 
 func (fh FileHeader) String() string {
@@ -228,9 +309,16 @@ func (ef *File) FetchChunk(offset int64) (Chunk, error) {
 	// Go to after Header
 	GoToSeeker(reader, int64(c.Header.SizeHeader))
 	c.ParseStringTable(reader)
+	// Seek the table boundary explicitly. StringAt restores the reader, but
+	// relying on every helper to preserve the cursor makes reopening/reparse
+	// fragile if a parser exits on a partial entry.
+	stringTableEnd := int64(c.Header.SizeHeader) + int64(sizeStringBucket)*4
+	GoToSeeker(reader, stringTableEnd)
 	if err := c.ParseTemplateTable(reader); err != nil {
 		return c, err
 	}
+	eventOffsetsStart := stringTableEnd + int64(sizeTemplateBucket)*4
+	GoToSeeker(reader, eventOffsetsStart)
 	if err := c.ParseEventOffsets(reader); err != nil {
 		return c, err
 	}
@@ -240,12 +328,13 @@ func (ef *File) FetchChunk(offset int64) (Chunk, error) {
 // Chunks returns a chan of all the Chunks found in the current file
 // return (chan Chunk)
 func (ef *File) Chunks() (cc chan Chunk) {
-	ss := datastructs.NewSortedSlice(0, int(ef.Header.ChunkCount))
+	header := ef.HeaderSnapshot()
+	ss := datastructs.NewSortedSlice(0, int(header.ChunkCount))
 	cc = make(chan Chunk)
 	go func() {
 		defer close(cc)
-		for i := uint16(0); i < ef.Header.ChunkCount; i++ {
-			offsetChunk := int64(ef.Header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
+		for i := uint16(0); i < header.ChunkCount; i++ {
+			offsetChunk := int64(header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
 			chunk, err := ef.FetchRawChunk(offsetChunk)
 			switch {
 			case err != nil && err != io.EOF:
@@ -265,11 +354,12 @@ func (ef *File) Chunks() (cc chan Chunk) {
 // UnorderedChunks returns a chan of all the Chunks found in the current file
 // return (chan Chunk)
 func (ef *File) UnorderedChunks() (cc chan Chunk) {
+	header := ef.HeaderSnapshot()
 	cc = make(chan Chunk)
 	go func() {
 		defer close(cc)
-		for i := uint16(0); i < ef.Header.ChunkCount; i++ {
-			offsetChunk := int64(ef.Header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
+		for i := uint16(0); i < header.ChunkCount; i++ {
+			offsetChunk := int64(header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
 			//chunk, err := ef.FetchChunk(offsetChunk)
 			chunk, err := ef.FetchRawChunk(offsetChunk)
 			switch {
@@ -300,6 +390,7 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 		for {
 			// Parse the file header again to get the updates in the file
 			ef.ParseFileHeader()
+			header := ef.HeaderSnapshot()
 
 			// check if we should stop or not
 			select {
@@ -310,9 +401,9 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 			}
 			curChunks := datastructs.NewSyncedSet()
 			//cs := make(ChunkSorter, 0, ef.Header.ChunkCount)
-			ss := datastructs.NewSortedSlice(0, int(ef.Header.ChunkCount))
-			for i := uint16(0); i < ef.Header.ChunkCount; i++ {
-				offsetChunk := int64(ef.Header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
+			ss := datastructs.NewSortedSlice(0, int(header.ChunkCount))
+			for i := uint16(0); i < header.ChunkCount; i++ {
+				offsetChunk := int64(header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
 				chunk, err := ef.FetchRawChunk(offsetChunk)
 				curChunks.Add(chunk.Header.FirstEventRecID, chunk.Header.LastEventRecID)
 				// We append only the Chunks whose EventRecordIds have not been treated yet
@@ -351,7 +442,7 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 			}
 
 			// Check if we should quit
-			if ef.Header.ChunkCount >= math.MaxUint16 {
+			if header.ChunkCount >= math.MaxUint16 {
 				log.Info("Monitoring stopped: maximum chunk number reached")
 				break
 			}
@@ -370,6 +461,7 @@ func (ef *File) Events() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 1)
 	go func() {
 		defer close(cgem)
+		seen := newEventReplayFilter()
 		for c := range ef.Chunks() {
 			cpc, err := ef.FetchChunk(c.Offset)
 			switch {
@@ -377,7 +469,9 @@ func (ef *File) Events() (cgem chan *GoEvtxMap) {
 				panic(err)
 			case err == nil:
 				for ev := range cpc.Events() {
-					cgem <- ev
+					if seen.admit(ev) {
+						cgem <- ev
+					}
 				}
 			}
 		}
@@ -393,6 +487,7 @@ func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 42)
 	go func() {
 		defer close(cgem)
+		seen := newEventReplayFilter()
 		chanQueue := make(chan (chan *GoEvtxMap), MaxJobs)
 		go func() {
 			defer close(chanQueue)
@@ -410,7 +505,9 @@ func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 		for ec := range chanQueue {
 			for event := range ec {
 				log.Debug(event)
-				cgem <- event
+				if seen.admit(event) {
+					cgem <- event
+				}
 			}
 		}
 	}()
@@ -425,6 +522,7 @@ func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 42)
 	go func() {
 		defer close(cgem)
+		seen := newEventReplayFilter()
 		chanQueue := make(chan (chan *GoEvtxMap), MaxJobs)
 		go func() {
 			defer close(chanQueue)
@@ -445,7 +543,9 @@ func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 		}()
 		for ec := range chanQueue {
 			for event := range ec {
-				cgem <- event
+				if seen.admit(event) {
+					cgem <- event
+				}
 			}
 		}
 	}()
@@ -468,6 +568,9 @@ func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan
 	cgem = make(chan *GoEvtxMap, 42)
 	go func() {
 		defer close(cgem)
+		// MonitorEvents' chunk feeder refreshes the header on every poll; do
+		// not refresh again here because monitoring intentionally starts from
+		// the current generation and then follows subsequent commits.
 		chanQueue := make(chan (chan *GoEvtxMap), jobs)
 		go func() {
 			defer close(chanQueue)
@@ -493,6 +596,8 @@ func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan
 
 // Close file
 func (ef *File) Close() error {
+	ef.Lock()
+	defer ef.Unlock()
 	if f, ok := ef.file.(io.Closer); ok {
 		return f.Close()
 	}

@@ -107,6 +107,22 @@ func NewChunk() Chunk {
 	return Chunk{StringTable: make(ChunkStringTable, 0), TemplateTable: make(TemplateTable, 0)}
 }
 
+// ResetParseState clears parsed header/table/offset/cache state while retaining
+// Offset and Data. It is used when the same Chunk value is reopened against a
+// new generation of the log bytes: stale template and string entries and the
+// old event cursor must never influence the new parse.
+func (c *Chunk) ResetParseState() {
+	c.Header = ChunkHeader{}
+	c.StringTable = make(ChunkStringTable)
+	c.TemplateTable = make(TemplateTable)
+	c.EventOffsets = nil
+}
+
+// Reset restores Chunk to the freshly initialized state returned by NewChunk.
+func (c *Chunk) Reset() {
+	*c = NewChunk()
+}
+
 // ParseChunkHeader parses a chunk header at offset
 func (c *Chunk) ParseChunkHeader(reader io.ReadSeeker) {
 	err := encoding.Unmarshal(reader, &c.Header, Endianness)
@@ -125,6 +141,9 @@ func (c Chunk) Less(s datastructs.Sortable) bool {
 // reader and modify the chunk object
 // @reader : reader object to parse string table from
 func (c *Chunk) ParseStringTable(reader io.ReadSeeker) {
+	// A reopened/reparsed chunk must not reuse string entries belonging to an
+	// older reader generation.
+	c.StringTable = make(ChunkStringTable)
 	strOffset := int32(0)
 	for i := int64(0); i < sizeStringBucket*4; i += 4 {
 		encoding.Unmarshal(reader, &strOffset, Endianness)
@@ -145,6 +164,10 @@ func (c *Chunk) ParseStringTable(reader io.ReadSeeker) {
 // the reader passed as parameter and modifies the current Chunk object
 // @reader : reader object to parse string table from
 func (c *Chunk) ParseTemplateTable(reader io.ReadSeeker) error {
+	// Template definitions are bound to the current chunk bytes. Replacing
+	// the map prevents a template at an unchanged relative offset in a new
+	// log generation from being decoded with a stale definition.
+	c.TemplateTable = make(TemplateTable)
 	templateDataOffset := int32(0)
 	for i := int32(0); i < sizeTemplateBucket*4; i = i + 4 {
 		//parse(buf, i, &tempOffsetTable[j])
@@ -243,13 +266,25 @@ func (c *Chunk) Events() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, len(c.EventOffsets))
 	go func() {
 		defer close(cgem)
+		seenRecordIDs := make(map[int64]struct{})
 		for _, eo := range c.EventOffsets {
 			// for every event offset, we parsed the event at that position
 			event := c.ParseEvent(int64(eo))
 			gem, err := event.GoEvtxMap(c)
-			if err == nil {
-				cgem <- gem
+			if err != nil {
+				continue
 			}
+
+			// Guard against a duplicated cursor/offset publication inside a
+			// chunk. The durable EventRecordID in the record header is the
+			// identity; zero is left unconstrained for synthetic/raw records.
+			if recordID := event.Header.ID; recordID != 0 {
+				if _, seen := seenRecordIDs[recordID]; seen {
+					continue
+				}
+				seenRecordIDs[recordID] = struct{}{}
+			}
+			cgem <- gem
 		}
 	}()
 	return
