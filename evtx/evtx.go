@@ -3,6 +3,7 @@ package evtx
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -48,6 +49,7 @@ var (
 	ErrCorruptedHeader = fmt.Errorf("Corrupted header")
 	ErrDirtyFile       = fmt.Errorf("File is flagged as dirty")
 	ErrRepairFailed    = fmt.Errorf("File header could not be repaired")
+	ErrFileBoundary    = fmt.Errorf("File boundary violation: %w", ErrCorruptedHeader)
 )
 
 // FileHeader structure definition
@@ -113,7 +115,15 @@ type File struct {
 // return File : File structure initialized
 func New(r io.ReadSeeker) (ef File, err error) {
 	ef.file = r
-	ef.ParseFileHeader()
+	if ef.file == nil {
+		return ef, fmt.Errorf("nil EVTX reader")
+	}
+	if err = ef.ParseFileHeader(); err != nil {
+		return ef, fmt.Errorf("%w: %w", ErrCorruptedHeader, err)
+	}
+	if err = ef.validateBoundary(); err != nil {
+		return ef, err
+	}
 	return
 }
 
@@ -126,12 +136,24 @@ func Open(filepath string) (ef File, err error) {
 		return
 	}
 
-	ef, err = New(file)
-	if err != nil {
-		return
+	ef, newErr := New(file)
+	// Preserve Open's existing header verification behavior. Verification is
+	// evaluated before constructor boundary errors so OpenDirty retains its
+	// dirty-header recovery entry point.
+	if verifyErr := ef.Header.Verify(); verifyErr != nil {
+		// Dirty files remain open because OpenDirty repairs the header using
+		// the same reader. All other admission failures are terminal.
+		if verifyErr != ErrDirtyFile {
+			_ = file.Close()
+			ef.file = nil
+		}
+		return ef, verifyErr
 	}
-
-	err = ef.Header.Verify()
+	if newErr != nil {
+		_ = file.Close()
+		ef.file = nil
+		return ef, newErr
+	}
 
 	return
 }
@@ -154,15 +176,53 @@ func (ef *File) SetMonitorExisting(value bool) {
 
 // ParseFileHeader parses a the file header of the file structure and modifies
 // the Header of the current structure
-func (ef *File) ParseFileHeader() {
+func (ef *File) ParseFileHeader() error {
 	ef.Lock()
 	defer ef.Unlock()
 
-	GoToSeeker(ef.file, 0)
-	err := encoding.Unmarshal(ef.file, &ef.Header, Endianness)
-	if err != nil {
-		panic(err)
+	if _, err := ef.file.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
+	return encoding.Unmarshal(ef.file, &ef.Header, Endianness)
+}
+
+// validateBoundary ensures every chunk declared by the file header has a
+// complete fixed-size extent before chunk data is read. A header with no
+// chunks only needs to contain the complete FileHeader structure, allowing
+// compact/minimal EVTX objects.
+func (ef *File) validateBoundary() error {
+	ef.Lock()
+	defer ef.Unlock()
+
+	current, err := ef.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrFileBoundary, err)
+	}
+
+	size, err := ef.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrFileBoundary, err)
+	}
+
+	if _, err := ef.file.Seek(current, io.SeekStart); err != nil {
+		return fmt.Errorf("%w: %v", ErrFileBoundary, err)
+	}
+
+	headerSize := int64(binary.Size(ef.Header))
+	if size < headerSize {
+		return fmt.Errorf("%w: header is %d bytes, file is %d bytes", ErrCorruptedHeader, headerSize, size)
+	}
+
+	for i := uint16(0); i < ef.Header.ChunkCount; i++ {
+		offset := int64(ef.Header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
+		end := offset + int64(ChunkSize)
+		if offset < 0 || end < offset || end > size {
+			return fmt.Errorf("%w: chunk %d at offset %d ends at %d, file size is %d",
+				ErrFileBoundary, i, offset, end, size)
+		}
+	}
+
+	return nil
 }
 
 func (fh FileHeader) String() string {
@@ -299,7 +359,9 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 		firstLoopFlag := !ef.monitorExisting
 		for {
 			// Parse the file header again to get the updates in the file
-			ef.ParseFileHeader()
+			if err := ef.ParseFileHeader(); err != nil {
+				panic(err)
+			}
 
 			// check if we should stop or not
 			select {
