@@ -69,6 +69,10 @@ func (pg *GoEvtxMap) GetMap(path *GoEvtxPath) (*GoEvtxMap, error) {
 				p := ge.(GoEvtxMap)
 				np := (*path)[1:]
 				return p.GetMap(&np)
+			case map[string]interface{}:
+				p := GoEvtxMap(ge.(map[string]interface{}))
+				np := (*path)[1:]
+				return p.GetMap(&np)
 			}
 		}
 	}
@@ -146,6 +150,9 @@ func (pg *GoEvtxMap) GetString(path *GoEvtxPath) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if s, ok := typedValueString(*pE); ok {
+		return s, nil
+	}
 	if s, ok := (*pE).(string); ok {
 		return s, nil
 	}
@@ -164,15 +171,64 @@ func (pg *GoEvtxMap) GetStringStrict(path *GoEvtxPath) string {
 // @path : path to search for
 // return (bool, error)
 func (pg *GoEvtxMap) GetBool(path *GoEvtxPath) (bool, error) {
-	s, err := pg.GetString(path)
-	if err != nil {
-		return false, &ErrEvtxEltNotFound{*path}
-	}
-	b, err := strconv.ParseBool(s)
+	pE, err := pg.Get(path)
 	if err != nil {
 		return false, err
 	}
-	return b, err
+	switch v := (*pE).(type) {
+	case bool:
+		return v, nil
+	case string:
+		b, err := strconv.ParseBool(v)
+		return b, err
+	default:
+		return false, fmt.Errorf("Bad type expect bool got %T", *pE)
+	}
+}
+
+func numberAsString(v interface{}) (string, bool) {
+	switch n := v.(type) {
+	case int:
+		return strconv.FormatInt(int64(n), 10), true
+	case int8:
+		return strconv.FormatInt(int64(n), 10), true
+	case int16:
+		return strconv.FormatInt(int64(n), 10), true
+	case int32:
+		return strconv.FormatInt(int64(n), 10), true
+	case int64:
+		return strconv.FormatInt(n, 10), true
+	case uint:
+		return strconv.FormatUint(uint64(n), 10), true
+	case uint8:
+		return strconv.FormatUint(uint64(n), 10), true
+	case uint16:
+		return strconv.FormatUint(uint64(n), 10), true
+	case uint32:
+		return strconv.FormatUint(uint64(n), 10), true
+	case uint64:
+		return strconv.FormatUint(n, 10), true
+	case float32:
+		return strconv.FormatFloat(float64(n), 'f', -1, 32), true
+	case float64:
+		return strconv.FormatFloat(n, 'f', -1, 64), true
+	default:
+		return "", false
+	}
+}
+
+func (pg *GoEvtxMap) getNumberString(path *GoEvtxPath) (string, error) {
+	pE, err := pg.Get(path)
+	if err != nil {
+		return "", err
+	}
+	if s, ok := numberAsString(*pE); ok {
+		return s, nil
+	}
+	if s, ok := (*pE).(string); ok {
+		return s, nil
+	}
+	return "", fmt.Errorf("Bad type expect number got %T", *pE)
 }
 
 func (pg *GoEvtxMap) GetBoolStrict(path *GoEvtxPath) bool {
@@ -187,9 +243,9 @@ func (pg *GoEvtxMap) GetBoolStrict(path *GoEvtxPath) bool {
 // @path : path to search for
 // return int64, error
 func (pg *GoEvtxMap) GetInt(path *GoEvtxPath) (int64, error) {
-	s, err := pg.GetString(path)
+	s, err := pg.getNumberString(path)
 	if err != nil {
-		return 0, &ErrEvtxEltNotFound{*path}
+		return 0, err
 	}
 	i, err := strconv.ParseInt(s, 0, 64)
 	if err != nil {
@@ -210,9 +266,9 @@ func (pg *GoEvtxMap) GetIntStrict(path *GoEvtxPath) int64 {
 // @path : path to search for
 // return uint64
 func (pg *GoEvtxMap) GetUint(path *GoEvtxPath) (uint64, error) {
-	s, err := pg.GetString(path)
+	s, err := pg.getNumberString(path)
 	if err != nil {
-		return 0, &ErrEvtxEltNotFound{*path}
+		return 0, err
 	}
 	u, err := strconv.ParseUint(s, 0, 64)
 	if err != nil {
@@ -245,9 +301,20 @@ func (pg *GoEvtxMap) GetTime(path *GoEvtxPath) (time.Time, error) {
 		return (*t).(time.Time), nil
 	case UTCTime:
 		return time.Time((*t).(UTCTime)), nil
+	case FileTime:
+		fileTime := (*t).(FileTime)
+		return time.Time(fileTime.Time()), nil
+	case *FileTime:
+		if (*t).(*FileTime) == nil {
+			return time.Time{}, fmt.Errorf("Cannot convert nil %T to time.Time", *t)
+		}
+		return time.Time((*t).(*FileTime).Time()), nil
 	case string:
 		return time.Parse(time.RFC3339Nano, (*t).(string))
 	default:
+		if parsed, ok := typedValueTime(*t); ok {
+			return parsed, nil
+		}
 		return time.Time{}, fmt.Errorf("Cannot convert %T to time.Time", *t)
 	}
 }
@@ -327,6 +394,9 @@ func (pg *GoEvtxMap) Equal(path *GoEvtxPath, i interface{}) bool {
 	if err != nil {
 		return false
 	}
+	if typedValueEqual(*t, i) {
+		return true
+	}
 	return reflect.DeepEqual(*t, i)
 }
 
@@ -340,6 +410,9 @@ func (pg *GoEvtxMap) AnyEqual(path *GoEvtxPath, is []interface{}) bool {
 		return false
 	}
 	for _, i := range is {
+		if typedValueEqual(*t, i) {
+			return true
+		}
 		if reflect.DeepEqual(i, *t) {
 			return true
 		}

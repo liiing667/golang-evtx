@@ -583,7 +583,7 @@ func (s *ValueFileTime) Value() interface{} {
 }
 
 func (s *ValueFileTime) Repr() interface{} {
-	return s.value.Time()
+	return s.value
 }
 
 ///////////////////////////////// ValueBool //////////////////////////////////
@@ -662,7 +662,7 @@ func (g *ValueGUID) Value() interface{} {
 }
 
 func (g *ValueGUID) Repr() interface{} {
-	return g.String()
+	return g.value
 }
 
 ///////////////////////////////////// SID /////////////////////////////////////
@@ -719,5 +719,5 @@ func (g *ValueSID) Value() interface{} {
 }
 
 func (g *ValueSID) Repr() interface{} {
-	return g.String()
+	return g.value
 }

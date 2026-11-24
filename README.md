@@ -15,7 +15,10 @@ An example is better than a long talk:
       "Hashes": "SHA1=F04EE61F0C6766590492CD3D9E26ECB0D4F501D8,MD5=68D9577E9E9E3A3DF0348AB3B86242B1,SHA256=7AE581DB760BCEEE4D18D6DE7BB98F46584656A65D9435B4E0C4223798F416D2,IMPHASH=ADB9F71ACD4F7D3CF761AB6C59A7F1E5",
       "Image": "C:\\Windows\\splwow64.exe",
       "ImageLoaded": "C:\\Windows\\System32\\dwmapi.dll",
-      "ProcessGuid": "B2796A13-E44F-5880-0000-001006E40F00",
+      "ProcessGuid": {
+        "type": "guid",
+        "value": "B2796A13-E44F-5880-0000-001006E40F00"
+      },
       "ProcessId": "4952",
       "Signature": "Microsoft Windows",
       "Signed": "true",
@@ -35,21 +38,42 @@ An example is better than a long talk:
       "Level": "4",
       "Opcode": "0",
       "Provider": {
-        "Guid": "5770385F-C22A-43E0-BF4C-06F5698FFBD9",
+        "Guid": {
+          "type": "guid",
+          "value": "5770385F-C22A-43E0-BF4C-06F5698FFBD9"
+        },
         "Name": "Microsoft-Windows-Sysmon"
       },
       "Security": {
-        "UserID": "S-1-5-18"
+        "UserID": {
+          "type": "sid",
+          "value": {
+            "Revision": 1,
+            "SubAuthorityCount": 1,
+            "IdentifierAuthority": [0, 0, 0, 0, 0, 5],
+            "SubAuthority": [18]
+          }
+        }
       },
       "Task": "7",
       "TimeCreated": {
-        "SystemTime": "2017-01-19T16:07:45Z"
+        "SystemTime": {
+          "type": "filetime",
+          "value": 131293156650000000
+        }
       },
       "Version": "3"
     }
   }
 }
  ```
+
+GUID, SID and Windows FILETIME values are serialized as typed envelopes so
+that their source EVTX type can be recovered after a JSON round trip. Regular
+JSON strings, numbers, booleans and null values continue to be emitted as
+their plain JSON forms. Existing path readers such as `GetString`, `GetTime`
+and `Equal` accept both the typed envelope and the historical textual
+representation.
 
 # Command Line Tools
 
