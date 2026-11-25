@@ -105,7 +105,11 @@ type File struct {
 	sync.Mutex      // We need it if we want to parse (read) chunks in several threads
 	Header          FileHeader
 	file            io.ReadSeeker
+	path            string
 	monitorExisting bool
+
+	dedupMu sync.RWMutex
+	deduper *RecordDeduper
 }
 
 // New EvtxFile structure initialized from an open buffer
@@ -113,7 +117,10 @@ type File struct {
 // return File : File structure initialized
 func New(r io.ReadSeeker) (ef File, err error) {
 	ef.file = r
-	ef.ParseFileHeader()
+	if f, ok := r.(*os.File); ok {
+		ef.path = f.Name()
+	}
+	err = ef.readHeader()
 	return
 }
 
@@ -130,6 +137,7 @@ func Open(filepath string) (ef File, err error) {
 	if err != nil {
 		return
 	}
+	ef.path = filepath
 
 	err = ef.Header.Verify()
 
@@ -146,6 +154,44 @@ func OpenDirty(filepath string) (ef File, err error) {
 	return
 }
 
+// Reset rewinds the underlying reader and reloads the committed file header.
+// It also clears stream-local deduplication evidence. Rejected observations are
+// never written to the EVTX, so a reset/reopen deterministically reconstructs
+// the same evidence by scanning the immutable source again.
+func (ef *File) Reset() error {
+	ef.Lock()
+	err := ef.readHeaderLocked()
+	ef.Unlock()
+	ef.dedupMu.Lock()
+	ef.deduper = nil
+	ef.dedupMu.Unlock()
+	return err
+}
+
+// Reopen opens a path-backed File again and resets all in-memory scan state.
+// Reader-backed Files are rewound instead.
+func (ef *File) Reopen() error {
+	ef.Lock()
+	if ef.path != "" {
+		f, err := os.Open(ef.path)
+		if err != nil {
+			ef.Unlock()
+			return err
+		}
+		old := ef.file
+		ef.file = f
+		if closer, ok := old.(io.Closer); ok && old != nil {
+			_ = closer.Close()
+		}
+	}
+	err := ef.readHeaderLocked()
+	ef.Unlock()
+	ef.dedupMu.Lock()
+	ef.deduper = nil
+	ef.dedupMu.Unlock()
+	return err
+}
+
 // SetMonitorExisting sets monitorExisting flag of EvtxFile struct in order to
 // return already existing events when using MonitorEvents
 func (ef *File) SetMonitorExisting(value bool) {
@@ -157,12 +203,26 @@ func (ef *File) SetMonitorExisting(value bool) {
 func (ef *File) ParseFileHeader() {
 	ef.Lock()
 	defer ef.Unlock()
-
-	GoToSeeker(ef.file, 0)
-	err := encoding.Unmarshal(ef.file, &ef.Header, Endianness)
-	if err != nil {
+	if err := ef.readHeaderLocked(); err != nil {
 		panic(err)
 	}
+}
+
+func (ef *File) readHeader() error {
+	ef.Lock()
+	defer ef.Unlock()
+	return ef.readHeaderLocked()
+}
+
+func (ef *File) readHeaderLocked() error {
+	if ef.file == nil {
+		return io.EOF
+	}
+	if _, err := ef.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	ef.Header = FileHeader{}
+	return encoding.Unmarshal(ef.file, &ef.Header, Endianness)
 }
 
 func (fh FileHeader) String() string {
@@ -368,6 +428,7 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 // return (chan *GoEvtxMap)
 func (ef *File) Events() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 1)
+	d := ef.newDeduper("Events")
 	go func() {
 		defer close(cgem)
 		for c := range ef.Chunks() {
@@ -376,8 +437,10 @@ func (ef *File) Events() (cgem chan *GoEvtxMap) {
 			case err != nil && err != io.EOF:
 				panic(err)
 			case err == nil:
-				for ev := range cpc.Events() {
-					cgem <- ev
+				for env := range cpc.parsedEvents() {
+					if _, ok := d.Admit(env); ok {
+						cgem <- env.gem
+					}
 				}
 			}
 		}
@@ -391,9 +454,10 @@ func (ef *File) Events() (cgem chan *GoEvtxMap) {
 // return (chan *GoEvtxMap)
 func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 42)
+	d := ef.newDeduper("FastEvents")
 	go func() {
 		defer close(cgem)
-		chanQueue := make(chan (chan *GoEvtxMap), MaxJobs)
+		chanQueue := make(chan (<-chan eventEnvelope), MaxJobs)
 		go func() {
 			defer close(chanQueue)
 			for pc := range ef.Chunks() {
@@ -402,15 +466,16 @@ func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 				case err != nil && err != io.EOF:
 					panic(err)
 				case err == nil:
-					ev := cpc.Events()
-					chanQueue <- ev
+					chanQueue <- cpc.parsedEvents()
 				}
 			}
 		}()
 		for ec := range chanQueue {
-			for event := range ec {
-				log.Debug(event)
-				cgem <- event
+			for env := range ec {
+				log.Debug(env.gem)
+				if _, ok := d.Admit(env); ok {
+					cgem <- env.gem
+				}
 			}
 		}
 	}()
@@ -423,9 +488,10 @@ func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 // return (chan *GoEvtxMap)
 func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 42)
+	d := ef.newDeduper("UnorderedEvents")
 	go func() {
 		defer close(cgem)
-		chanQueue := make(chan (chan *GoEvtxMap), MaxJobs)
+		chanQueue := make(chan (<-chan eventEnvelope), MaxJobs)
 		go func() {
 			defer close(chanQueue)
 			for pc := range ef.UnorderedChunks() {
@@ -438,14 +504,15 @@ func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 				case err != nil && err != io.EOF:
 					panic(err)
 				case err == nil:
-					ev := cpc.Events()
-					chanQueue <- ev
+					chanQueue <- cpc.parsedEvents()
 				}
 			}
 		}()
 		for ec := range chanQueue {
-			for event := range ec {
-				cgem <- event
+			for env := range ec {
+				if _, ok := d.Admit(env); ok {
+					cgem <- env.gem
+				}
 			}
 		}
 	}()
@@ -457,18 +524,16 @@ func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 // @stop: a channel used to stop the monitoring if needed
 // return (chan *GoEvtxMap)
 func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan *GoEvtxMap) {
-	// Normally, it should not be needed to add a second check here on the
-	// EventRecordID since the record ids in the chunks are not supposed to overlap
-	// TODO: Add a EventRecordID marker if needed
 	sleepTime := DefaultMonitorSleep
 	if len(sleep) > 0 {
 		sleepTime = sleep[0]
 	}
 	jobs := MaxJobs
 	cgem = make(chan *GoEvtxMap, 42)
+	d := ef.newDeduper("MonitorEvents")
 	go func() {
 		defer close(cgem)
-		chanQueue := make(chan (chan *GoEvtxMap), jobs)
+		chanQueue := make(chan (<-chan eventEnvelope), jobs)
 		go func() {
 			defer close(chanQueue)
 			// this chan ends only when value is put into stop
@@ -478,13 +543,14 @@ func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan
 				// and thus the chan is taken on the pointer and since the object pointed
 				// changes -> kaboom
 				cpc := pc
-				ev := cpc.Events()
-				chanQueue <- ev
+				chanQueue <- cpc.parsedEvents()
 			}
 		}()
 		for ec := range chanQueue {
-			for event := range ec {
-				cgem <- event
+			for env := range ec {
+				if _, ok := d.Admit(env); ok {
+					cgem <- env.gem
+				}
 			}
 		}
 	}()

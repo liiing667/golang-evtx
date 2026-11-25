@@ -91,3 +91,32 @@ func (e Event) String() string {
 		e.Header.ID,
 		e.Header.Timestamp)
 }
+
+// RecordID returns the binary EventRecordID from the event header.
+func (h EventHeader) RecordID() int64 { return h.ID }
+
+// EventRecordID mirrors the vocabulary used by the decoded XML event.
+func (h EventHeader) EventRecordID() int64 { return h.ID }
+
+// Identity returns the canonical record identity and source coordinates for
+// a parsed binary event.
+func (e Event) Identity() RecordIdentity {
+	return eventEnvelope{event: e}.identity("Event", "")
+}
+
+// RecordIdentity is an alias for Identity.
+func (e Event) RecordIdentity() RecordIdentity { return e.Identity() }
+
+// RecordID returns the canonical binary record id.
+func (e Event) RecordID() int64 { return e.Header.ID }
+
+// EventRecordID returns the header EventRecordID. The decoded GoEvtxMap value
+// can differ only for malformed/tampered records; the stream deduper records
+// both values in its evidence.
+func (e Event) EventRecordID() int64 { return e.Header.ID }
+
+// SameRecordIdentity reports whether two binary events claim the same
+// non-zero EventRecordID.
+func (e Event) SameRecordIdentity(other Event) bool {
+	return e.Header.ID != 0 && e.Header.ID == other.Header.ID
+}

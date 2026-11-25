@@ -283,6 +283,12 @@ func (pg *GoEvtxMap) Channel() string {
 // EventRecordID returns the EventRecordID of the the event. It panics if the
 // attribute is not found in the event.
 func (pg *GoEvtxMap) EventRecordID() int64 {
+	// Accept both the parser's string representation and structured numeric
+	// values used by tests/alternative producers before falling back to the
+	// historical strict string accessor.
+	if id, ok := recordIDFromMap(pg); ok {
+		return id
+	}
 	return pg.GetIntStrict(&EventRecordIDPath)
 }
 

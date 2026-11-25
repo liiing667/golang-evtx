@@ -99,6 +99,7 @@ type Chunk struct {
 	TemplateTable TemplateTable
 	EventOffsets  []int32
 	Data          []byte
+	deduper       *RecordDeduper
 }
 
 // NewChunk initialize and returns a new Chunk structure
@@ -241,19 +242,57 @@ func (c *Chunk) ParseEvent(offset int64) (e Event) {
 func (c *Chunk) Events() (cgem chan *GoEvtxMap) {
 	// Unbuffered Event channel
 	cgem = make(chan *GoEvtxMap, len(c.EventOffsets))
+	d := NewRecordDeduper("Chunk.Events")
+	c.deduper = d
 	go func() {
 		defer close(cgem)
-		for _, eo := range c.EventOffsets {
-			// for every event offset, we parsed the event at that position
-			event := c.ParseEvent(int64(eo))
-			gem, err := event.GoEvtxMap(c)
-			if err == nil {
-				cgem <- gem
+		for env := range c.parsedEvents() {
+			if _, ok := d.Admit(env); ok {
+				cgem <- env.gem
 			}
 		}
 	}()
 	return
 }
+
+// parsedEvents emits every successfully decoded event in chunk order without
+// applying stream-level deduplication. File event streams use the binary
+// coordinates carried by the envelope to make cross-chunk decisions and retain
+// source evidence.
+func (c *Chunk) parsedEvents() <-chan eventEnvelope {
+	cec := make(chan eventEnvelope, len(c.EventOffsets))
+	go func() {
+		defer close(cec)
+		for _, eo := range c.EventOffsets {
+			// For every event offset, parse the event at that position.
+			event := c.ParseEvent(int64(eo))
+			gem, err := event.GoEvtxMap(c)
+			if err != nil || gem == nil {
+				continue
+			}
+			cec <- eventEnvelope{
+				event:       event,
+				gem:         gem,
+				chunkOffset: c.Offset,
+			}
+		}
+	}()
+	return cec
+}
+
+// RejectedRecords returns duplicate evidence collected by Chunk.Events.
+func (c *Chunk) RejectedRecords() []Rejection {
+	if c == nil || c.deduper == nil {
+		return []Rejection{}
+	}
+	return c.deduper.Rejected()
+}
+
+// RejectedEvents and vocabulary aliases return chunk-local conflict evidence.
+func (c *Chunk) RejectedEvents() []Rejection     { return c.RejectedRecords() }
+func (c *Chunk) Rejections() []Rejection         { return c.RejectedRecords() }
+func (c *Chunk) Conflicts() []Rejection          { return c.RejectedRecords() }
+func (c *Chunk) DuplicateConflicts() []Rejection { return c.RejectedRecords() }
 
 func (c Chunk) String() string {
 	templateOffsets := make([]int32, len(c.TemplateTable))
