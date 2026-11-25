@@ -54,6 +54,13 @@ func (e *Event) IsValid() bool {
 // @c : chunk pointer used for template data already parsed
 // return (*GoEvtxMap, error)
 func (e Event) GoEvtxMap(c *Chunk) (pge *GoEvtxMap, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("failed to convert event to GoEvtxMap: %v", r)
+			pge = nil
+		}
+	}()
+
 	// An Event can contain only BinXMLFragments
 	if !e.IsValid() {
 		err = ErrInvalidEvent
@@ -71,10 +78,15 @@ func (e Event) GoEvtxMap(c *Chunk) (pge *GoEvtxMap, err error) {
 	fragment, ok := element.(*Fragment)
 	switch {
 	case !ok && ModeCarving:
-		return
+		if err == nil {
+			err = ErrInvalidEvent
+		}
+		return nil, err
 	case !ok:
-		// Way to raise panic
-		_ = element.(*Fragment)
+		return nil, ErrInvalidEvent
+	}
+	if err != nil && err != io.EOF {
+		return nil, err
 	}
 	return fragment.GoEvtxMap(), err
 }

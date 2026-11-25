@@ -468,6 +468,73 @@ type PIData struct {
 
 ////////////////////////// BinXmlTemplateInstance //////////////////////////////
 
+func (ti *TemplateInstance) validateSubstitution(s *NormalSubstitution) error {
+	id := int(s.SubID)
+	if id < 0 || id >= len(ti.Data.Values) || id >= len(ti.Data.ValDescs) {
+		log.Errorf("template substitution %d references an out of range value slot (have %d values)",
+			s.SubID, ti.Data.NumValues)
+		return ErrInvalidSubstitution
+	}
+
+	if ti.Data.Values[id] == nil {
+		log.Errorf("template substitution %d references an incomplete value", s.SubID)
+		return ErrInvalidSubstitution
+	}
+
+	expected := ti.Data.ValDescs[id].ValType
+	got := ValueType(s.ValType)
+	if got != expected {
+		log.Errorf("template substitution %d has type 0x%02x but value slot has type 0x%02x",
+			s.SubID, uint8(got), uint8(expected))
+		return ErrInvalidSubstitution
+	}
+
+	// An optional substitution is still allowed to reference a legal NullType
+	// value. Do not turn that representation into an error or an empty Go value.
+	return nil
+}
+
+func (ti *TemplateInstance) validateElement(elt Element) error {
+	switch e := elt.(type) {
+	case nil:
+		return ErrInvalidSubstitution
+	case *ElementStart:
+		for i := range e.AttributeList.Attributes {
+			if err := ti.validateElement(e.AttributeList.Attributes[i].AttributeData); err != nil {
+				return err
+			}
+		}
+	case *OptionalSubstitution:
+		return ti.validateSubstitution(&e.NormalSubstitution)
+	case *NormalSubstitution:
+		return ti.validateSubstitution(e)
+	case *TemplateInstance:
+		return e.ValidateSubstitutions()
+	case *Fragment:
+		return ti.validateElement(e.BinXMLElement)
+	}
+	return nil
+}
+
+// ValidateSubstitutions verifies that every substitution in the template
+// identifies an existing, complete and type-compatible value in the template
+// instance data. It must be called before converting an event to a GoEvtxMap
+// so malformed substitutions cannot be silently represented as empty values.
+func (ti *TemplateInstance) ValidateSubstitutions() error {
+	for _, elt := range ti.Definition.Data.Elements {
+		if err := ti.validateElement(elt); err != nil {
+			return err
+		}
+	}
+
+	for _, value := range ti.Data.Values {
+		if err := ti.validateElement(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (ti *TemplateInstance) Root() Node {
 	node, _ := NodeTree(ti.Definition.Data.Elements, 0)
 	return node
@@ -480,6 +547,9 @@ func (ti *TemplateInstance) ElementToGoEvtx(elt Element) GoEvtxElement {
 		return elt.(*ValueText).String()
 	case *OptionalSubstitution:
 		s := elt.(*OptionalSubstitution)
+		if err := ti.validateSubstitution(&s.NormalSubstitution); err != nil {
+			return nil
+		}
 		// Manage Carving mode
 		switch {
 		case int(s.SubID) < len(ti.Data.Values):
@@ -491,6 +561,9 @@ func (ti *TemplateInstance) ElementToGoEvtx(elt Element) GoEvtxElement {
 		}
 	case *NormalSubstitution:
 		s := elt.(*NormalSubstitution)
+		if err := ti.validateSubstitution(s); err != nil {
+			return nil
+		}
 		// Manage Carving mode
 		switch {
 		case int(s.SubID) < len(ti.Data.Values):
@@ -801,6 +874,7 @@ func (tid *TemplateInstanceData) Parse(reader io.ReadSeeker) error {
 		if err != nil {
 			log.Errorf("%v : %s", tid.ValDescs[i], err)
 			log.DebugDontPanicf("%v : %s", tid.ValDescs[i], err)
+			return err
 		}
 	}
 	return err

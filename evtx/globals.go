@@ -13,6 +13,9 @@ import (
 
 var (
 	ErrInvalidEvent = errors.New("Error Invalid Event")
+	// ErrInvalidSubstitution is returned when a template references a slot
+	// which does not identify a value present in the template instance data.
+	ErrInvalidSubstitution = errors.New("Invalid template substitution")
 	// ErrBadEvtxFile error definition
 	ErrBadEvtxFile = errors.New("Bad file magic")
 	// ErrBadChunkMagic error definition

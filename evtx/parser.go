@@ -67,7 +67,7 @@ func Parse(reader io.ReadSeeker, c *Chunk, tiFlag bool) (Element, error) {
 		f.BinXMLElement, err = Parse(reader, c, tiFlag)
 		checkFullParsingError(err, reader, &f, c)
 		if err != nil {
-			return &f, err
+			return nil, err
 		}
 		// We hack a bit over here creating a fake TemplateInstance to benefit from
 		// the further GoEvtxMap convertion of it. Conceptually it makes sense since
@@ -135,17 +135,27 @@ func Parse(reader io.ReadSeeker, c *Chunk, tiFlag bool) (Element, error) {
 				if err != nil {
 					return nil, err
 				}
+				err = ti.ValidateSubstitutions()
+				if err != nil {
+					return nil, err
+				}
 				return &ti, nil
 			}
 		}
 		// We have to parse the template since it cannot be found the template table
 		err = ti.Parse(reader)
-		if c != nil {
+		if err == nil {
+			err = ti.ValidateSubstitutions()
+		}
+		if err == nil && c != nil {
 			// Update template table
 			c.TemplateTable[ti.Definition.Header.DataOffset] = ti.Definition.Data
 		}
 		checkParsingError(err, reader, &ti)
-		return &ti, err
+		if err != nil {
+			return nil, err
+		}
+		return &ti, nil
 	case TokenValue1, TokenValue2:
 		// ValueText
 		vt := ValueText{}
