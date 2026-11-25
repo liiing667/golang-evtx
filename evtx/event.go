@@ -70,7 +70,7 @@ func (e Event) GoEvtxMap(c *Chunk) (pge *GoEvtxMap, err error) {
 	// If not a BinXMLFragment a panic will be raised
 	fragment, ok := element.(*Fragment)
 	switch {
-	case !ok && ModeCarving:
+	case !ok && (ModeCarving || (c != nil && c.Carving)):
 		return
 	case !ok:
 		// Way to raise panic
@@ -90,4 +90,47 @@ func (e Event) String() string {
 		e.Header.Size,
 		e.Header.ID,
 		e.Header.Timestamp)
+}
+
+// RecordID returns the Event Record Identifier from the fixed event header.
+func (e Event) RecordID() int64 { return e.Header.ID }
+
+// EventRecordID mirrors the vocabulary used by decoded XML consumers.
+func (e Event) EventRecordID() int64 { return e.Header.ID }
+
+// RecordID returns the Event Record Identifier from an event header.
+func (h EventHeader) RecordID() int64 { return h.ID }
+
+// EventRecordID mirrors the vocabulary used by decoded XML consumers.
+func (h EventHeader) EventRecordID() int64 { return h.ID }
+
+// SourceOffset returns the absolute file offset of an event when chunkOffset
+// is the absolute offset of its containing chunk.
+func (e Event) SourceOffset(chunkOffset int64) int64 {
+	return chunkOffset + e.Offset
+}
+
+// AbsoluteOffset is an alias for SourceOffset.
+func (e Event) AbsoluteOffset(chunkOffset int64) int64 {
+	return e.SourceOffset(chunkOffset)
+}
+
+// Identity builds a RecordIdentity with source coordinates for an event.
+func (e Event) Identity(chunkOffset ...int64) RecordIdentity {
+	co := int64(0)
+	if len(chunkOffset) > 0 {
+		co = chunkOffset[0]
+	}
+	return eventEnvelope{event: e, chunkOffset: co}.identity("Event", "")
+}
+
+// RecordIdentity is an alias for Identity.
+func (e Event) RecordIdentity(chunkOffset ...int64) RecordIdentity {
+	return e.Identity(chunkOffset...)
+}
+
+// SameRecordIdentity reports whether two binary events claim the same non-zero
+// EventRecordID.
+func (e Event) SameRecordIdentity(other Event) bool {
+	return e.Header.ID != 0 && e.Header.ID == other.Header.ID
 }

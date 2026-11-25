@@ -34,7 +34,11 @@ func (cs ChunkSorter) Len() int {
 
 // Implement Sortable interface
 func (cs ChunkSorter) Less(i, j int) bool {
-	return cs[i].Header.NumFirstRecLog < cs[j].Header.NumFirstRecLog
+	if cs[i].Header.NumFirstRecLog != cs[j].Header.NumFirstRecLog {
+		return cs[i].Header.NumFirstRecLog < cs[j].Header.NumFirstRecLog
+	}
+	// Deterministic source order for reused/dirty chunk generations.
+	return cs[i].Offset < cs[j].Offset
 }
 
 // Implement Sortable interface
@@ -94,7 +98,11 @@ func (f *FileHeader) Repair(r io.ReadSeeker) error {
 	// Fixing chunk count
 	f.ChunkCount = cc
 	// Fixing LastChunkNum
-	f.LastChunkNum = uint64(f.ChunkCount - 1)
+	if f.ChunkCount > 0 {
+		f.LastChunkNum = uint64(f.ChunkCount - 1)
+	} else {
+		f.LastChunkNum = 0
+	}
 	// File is not dirty anymore
 	f.Flags = 0
 	return nil
@@ -105,16 +113,77 @@ type File struct {
 	sync.Mutex      // We need it if we want to parse (read) chunks in several threads
 	Header          FileHeader
 	file            io.ReadSeeker
+	path            string
 	monitorExisting bool
+
+	dedupMu                sync.Mutex
+	Deduper                *RecordDeduper
+	CrossScanDeduplication bool
+	truncatedRecovery      bool
 }
 
 // New EvtxFile structure initialized from an open buffer
 // @r : buffer containing evtx data to parse
 // return File : File structure initialized
 func New(r io.ReadSeeker) (ef File, err error) {
+	if r == nil {
+		return ef, ErrCorruptedHeader
+	}
 	ef.file = r
-	ef.ParseFileHeader()
+	if f, ok := r.(*os.File); ok {
+		ef.path = f.Name()
+	}
+	if err = ef.parseFileHeader(); err != nil {
+		return ef, err
+	}
+	if !bytes.Equal(ef.Header.Magic[:], []byte("ElfFile\x00")) {
+		return ef, ErrCorruptedHeader
+	}
+	// A dirty log is by definition mid-write; let OpenDirty repair its header
+	// and recover whatever complete chunks remain instead of rejecting it at
+	// the admission boundary.
+	if ef.Header.Flags != 1 {
+		if err = ef.validateAvailableChunkMagics(); err != nil {
+			return ef, err
+		}
+	}
 	return
+}
+
+// validateAvailableChunkMagics rejects a fully readable chunk header carrying
+// a non-zero but invalid signature. Short/truncated and zero-filled chunk
+// prefixes are left for recovery/carving paths so ordinary truncated chunks
+// remain readable.
+func (ef *File) validateAvailableChunkMagics() error {
+	if ef.file == nil {
+		return nil
+	}
+
+	current, err := ef.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	defer ef.file.Seek(current, io.SeekStart)
+
+	for i := uint16(0); i < ef.Header.ChunkCount; i++ {
+		offset := int64(ef.Header.ChunkDataOffset) + int64(ChunkSize)*int64(i)
+		if _, err := ef.file.Seek(offset, io.SeekStart); err != nil {
+			continue
+		}
+
+		magic := make([]byte, 8)
+		if _, err := io.ReadFull(ef.file, magic); err != nil {
+			// A truncated chunk is a supported recovery case.
+			continue
+		}
+		if bytes.Equal(magic, make([]byte, 8)) {
+			continue
+		}
+		if string(magic) != ChunkMagic {
+			return fmt.Errorf("%w: invalid chunk magic at offset %d", ErrCorruptedHeader, offset)
+		}
+	}
+	return nil
 }
 
 // New EvtxFile structure initialized from file
@@ -125,9 +194,11 @@ func Open(filepath string) (ef File, err error) {
 	if err != nil {
 		return
 	}
+	ef.path = filepath
 
 	ef, err = New(file)
 	if err != nil {
+		file.Close()
 		return
 	}
 
@@ -143,7 +214,84 @@ func OpenDirty(filepath string) (ef File, err error) {
 	if ef, err = Open(filepath); err == ErrDirtyFile {
 		err = ef.Header.Repair(ef.file)
 	}
+	if err != nil && err != ErrDirtyFile {
+		if ef.file != nil {
+			if closer, ok := ef.file.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+		return
+	}
+
+	// OpenDirty is the public entry point used by recovery/carving
+	// consumers. Share one identity frontier across repeated scans and
+	// reopened handles for the same file generation. Truncated chunk
+	// recovery remains enabled; identity deduplication never removes bytes.
+	ef.path = filepath
+	ef.CrossScanDeduplication = true
+	ef.truncatedRecovery = true
+	ef.Deduper = OpenDirtyDeduper(filepath)
 	return
+}
+
+// Reopen discards the current reader and parse position and reopens the file
+// from its path. The cross-scan identity frontier of an OpenDirty consumer is
+// retained, so a reopened scan does not republish records already observed in
+// this file generation. Environment files without a path are rewound instead.
+func (ef *File) Reopen() error {
+	ef.Lock()
+	path := ef.path
+	var newFile *os.File
+	var err error
+	if path != "" {
+		newFile, err = os.Open(path)
+		if err != nil {
+			ef.Unlock()
+			return err
+		}
+	}
+	old := ef.file
+	if newFile != nil {
+		ef.file = newFile
+	}
+	ef.Header = FileHeader{}
+	if ef.file == nil {
+		ef.Unlock()
+		return io.EOF
+	}
+	GoToSeeker(ef.file, 0)
+	err = encoding.Unmarshal(ef.file, &ef.Header, Endianness)
+	if err == nil && ef.Header.Flags == 1 {
+		if repairErr := ef.Header.Repair(ef.file); repairErr != nil {
+			err = repairErr
+		}
+	}
+	ef.Unlock()
+
+	if newFile != nil && old != nil && old != newFile {
+		if closer, ok := old.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	ef.dedupMu.Lock()
+	if ef.CrossScanDeduplication && ef.Deduper == nil && path != "" {
+		ef.Deduper = OpenDirtyDeduper(path)
+	}
+	ef.dedupMu.Unlock()
+	return err
+}
+
+// Reset rewinds the reader and reloads the committed file header while keeping
+// the same File and its cross-scan identity state.
+func (ef *File) Reset() error {
+	return ef.Reopen()
+}
+
+// Path returns the path used to open the File, if any.
+func (ef *File) Path() string {
+	ef.Lock()
+	defer ef.Unlock()
+	return ef.path
 }
 
 // SetMonitorExisting sets monitorExisting flag of EvtxFile struct in order to
@@ -155,14 +303,25 @@ func (ef *File) SetMonitorExisting(value bool) {
 // ParseFileHeader parses a the file header of the file structure and modifies
 // the Header of the current structure
 func (ef *File) ParseFileHeader() {
+	if err := ef.parseFileHeader(); err != nil {
+		panic(err)
+	}
+}
+
+// parseFileHeader reloads the file header and returns read/decoding errors
+// instead of panicking. Public ParseFileHeader keeps its historical panic
+// behaviour for callers that depend on it.
+func (ef *File) parseFileHeader() error {
 	ef.Lock()
 	defer ef.Unlock()
 
-	GoToSeeker(ef.file, 0)
-	err := encoding.Unmarshal(ef.file, &ef.Header, Endianness)
-	if err != nil {
-		panic(err)
+	if ef.file == nil {
+		return io.EOF
 	}
+	GoToSeeker(ef.file, 0)
+	ef.Header = FileHeader{}
+	err := encoding.Unmarshal(ef.file, &ef.Header, Endianness)
+	return err
 }
 
 func (fh FileHeader) String() string {
@@ -199,10 +358,20 @@ func (ef *File) FetchRawChunk(offset int64) (Chunk, error) {
 	ef.Lock()
 	defer ef.Unlock()
 	c := NewChunk()
+	c.Carving = ef.truncatedRecovery
+	if ef.CrossScanDeduplication {
+		ef.dedupMu.Lock()
+		c.Deduper = ef.Deduper
+		ef.dedupMu.Unlock()
+	}
 	GoToSeeker(ef.file, offset)
 	c.Offset = offset
 	c.Data = make([]byte, ChunkHeaderSize)
-	if _, err := ef.file.Read(c.Data); err != nil {
+	n, err := ef.file.Read(c.Data)
+	if err != nil && n == 0 {
+		return c, err
+	}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return c, err
 	}
 	reader := bytes.NewReader(c.Data)
@@ -217,22 +386,63 @@ func (ef *File) FetchChunk(offset int64) (Chunk, error) {
 	ef.Lock()
 	defer ef.Unlock()
 	c := NewChunk()
+	c.Carving = ef.truncatedRecovery
+	if ef.CrossScanDeduplication {
+		ef.dedupMu.Lock()
+		c.Deduper = ef.Deduper
+		ef.dedupMu.Unlock()
+	}
 	GoToSeeker(ef.file, offset)
 	c.Offset = offset
 	c.Data = make([]byte, ChunkSize)
-	if _, err := ef.file.Read(c.Data); err != nil {
-		return c, err
+	n, readErr := io.ReadFull(ef.file, c.Data)
+	if readErr != nil && n == 0 {
+		return c, readErr
 	}
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return c, readErr
+	}
+	if n < ChunkHeaderSize {
+		return c, io.ErrUnexpectedEOF
+	}
+	// Keep only the bytes actually present so a partial trailing record is
+	// rejected by the parser bounds instead of being decoded from zero
+	// padding.
+	c.Data = c.Data[:n]
 	reader := bytes.NewReader(c.Data)
 	c.ParseChunkHeader(reader)
 	// Go to after Header
-	GoToSeeker(reader, int64(c.Header.SizeHeader))
-	c.ParseStringTable(reader)
-	if err := c.ParseTemplateTable(reader); err != nil {
-		return c, err
+	stringTableStart := int64(c.Header.SizeHeader)
+	if stringTableStart < ChunkHeaderSize {
+		stringTableStart = ChunkHeaderSize
 	}
-	if err := c.ParseEventOffsets(reader); err != nil {
-		return c, err
+	if stringTableStart > ChunkSize {
+		stringTableStart = ChunkHeaderSize
+	}
+	stringTableEnd := stringTableStart + int64(sizeStringBucket)*4
+	eventOffsetsStart := stringTableEnd + int64(sizeTemplateBucket)*4
+	if eventOffsetsStart > ChunkSize {
+		// A malformed/truncated chunk cannot provide a valid table boundary.
+		// Leave the default event offset list empty rather than seeking into
+		// an unrelated region of the chunk data.
+		eventOffsetsStart = ChunkSize
+	}
+	GoToSeeker(reader, stringTableStart)
+	c.ParseStringTable(reader)
+	GoToSeeker(reader, stringTableEnd)
+	templateErr := c.ParseTemplateTable(reader)
+
+	// Event offsets live at a fixed table boundary. Seeking there explicitly
+	// keeps truncated/template-damaged chunks recoverable instead of letting a
+	// short template parse move the event cursor.
+	GoToSeeker(reader, eventOffsetsStart)
+	offsetErr := c.ParseEventOffsets(reader)
+
+	if templateErr != nil {
+		return c, templateErr
+	}
+	if offsetErr != nil {
+		return c, offsetErr
 	}
 	return c, nil
 }
@@ -343,9 +553,9 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 			for rc := range ss.ReversedIter() {
 				chunk, err := ef.FetchChunk(rc.(Chunk).Offset)
 				switch {
-				case err != nil && err != io.EOF:
+				case err != nil && err != io.EOF && !ef.truncatedRecovery:
 					panic(err)
-				case err == nil:
+				case err == nil || len(chunk.EventOffsets) > 0:
 					cc <- chunk
 				}
 			}
@@ -368,20 +578,21 @@ func (ef *File) monitorChunks(stop chan bool, sleep time.Duration) (cc chan Chun
 // return (chan *GoEvtxMap)
 func (ef *File) Events() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 1)
+	d := ef.scanDeduper("Events")
 	go func() {
 		defer close(cgem)
 		for c := range ef.Chunks() {
 			cpc, err := ef.FetchChunk(c.Offset)
-			switch {
-			case err != nil && err != io.EOF:
-				panic(err)
-			case err == nil:
-				for ev := range cpc.Events() {
-					cgem <- ev
+			ec, ok := ef.chunkEnvelopes(cpc, err)
+			if !ok {
+				continue
+			}
+			for env := range ec {
+				if _, admit := d.Admit(env); admit {
+					cgem <- env.gem
 				}
 			}
 		}
-
 	}()
 	return
 }
@@ -391,26 +602,26 @@ func (ef *File) Events() (cgem chan *GoEvtxMap) {
 // return (chan *GoEvtxMap)
 func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 42)
+	d := ef.scanDeduper("FastEvents")
 	go func() {
 		defer close(cgem)
-		chanQueue := make(chan (chan *GoEvtxMap), MaxJobs)
+		chanQueue := make(chan (<-chan eventEnvelope), MaxJobs)
 		go func() {
 			defer close(chanQueue)
 			for pc := range ef.Chunks() {
 				cpc, err := ef.FetchChunk(pc.Offset)
-				switch {
-				case err != nil && err != io.EOF:
-					panic(err)
-				case err == nil:
-					ev := cpc.Events()
-					chanQueue <- ev
+				ec, ok := ef.chunkEnvelopes(cpc, err)
+				if ok {
+					chanQueue <- ec
 				}
 			}
 		}()
 		for ec := range chanQueue {
-			for event := range ec {
-				log.Debug(event)
-				cgem <- event
+			for env := range ec {
+				log.Debug(env.gem)
+				if _, admit := d.Admit(env); admit {
+					cgem <- env.gem
+				}
 			}
 		}
 	}()
@@ -423,9 +634,10 @@ func (ef *File) FastEvents() (cgem chan *GoEvtxMap) {
 // return (chan *GoEvtxMap)
 func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 	cgem = make(chan *GoEvtxMap, 42)
+	d := ef.scanDeduper("UnorderedEvents")
 	go func() {
 		defer close(cgem)
-		chanQueue := make(chan (chan *GoEvtxMap), MaxJobs)
+		chanQueue := make(chan (<-chan eventEnvelope), MaxJobs)
 		go func() {
 			defer close(chanQueue)
 			for pc := range ef.UnorderedChunks() {
@@ -434,18 +646,17 @@ func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 				// and thus the chan is taken on the pointer and since the object pointed
 				// changes -> kaboom
 				cpc, err := ef.FetchChunk(pc.Offset)
-				switch {
-				case err != nil && err != io.EOF:
-					panic(err)
-				case err == nil:
-					ev := cpc.Events()
-					chanQueue <- ev
+				ec, ok := ef.chunkEnvelopes(cpc, err)
+				if ok {
+					chanQueue <- ec
 				}
 			}
 		}()
 		for ec := range chanQueue {
-			for event := range ec {
-				cgem <- event
+			for env := range ec {
+				if _, admit := d.Admit(env); admit {
+					cgem <- env.gem
+				}
 			}
 		}
 	}()
@@ -457,18 +668,16 @@ func (ef *File) UnorderedEvents() (cgem chan *GoEvtxMap) {
 // @stop: a channel used to stop the monitoring if needed
 // return (chan *GoEvtxMap)
 func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan *GoEvtxMap) {
-	// Normally, it should not be needed to add a second check here on the
-	// EventRecordID since the record ids in the chunks are not supposed to overlap
-	// TODO: Add a EventRecordID marker if needed
 	sleepTime := DefaultMonitorSleep
 	if len(sleep) > 0 {
 		sleepTime = sleep[0]
 	}
 	jobs := MaxJobs
 	cgem = make(chan *GoEvtxMap, 42)
+	d := ef.scanDeduper("MonitorEvents")
 	go func() {
 		defer close(cgem)
-		chanQueue := make(chan (chan *GoEvtxMap), jobs)
+		chanQueue := make(chan (<-chan eventEnvelope), jobs)
 		go func() {
 			defer close(chanQueue)
 			// this chan ends only when value is put into stop
@@ -478,17 +687,31 @@ func (ef *File) MonitorEvents(stop chan bool, sleep ...time.Duration) (cgem chan
 				// and thus the chan is taken on the pointer and since the object pointed
 				// changes -> kaboom
 				cpc := pc
-				ev := cpc.Events()
-				chanQueue <- ev
+				chanQueue <- cpc.parsedEvents()
 			}
 		}()
 		for ec := range chanQueue {
-			for event := range ec {
-				cgem <- event
+			for env := range ec {
+				if _, admit := d.Admit(env); admit {
+					cgem <- env.gem
+				}
 			}
 		}
 	}()
 	return
+}
+
+// chunkEnvelopes preserves the historical fail-fast behavior for parser errors
+// on ordinary opens. OpenDirty recovery mode additionally publishes event
+// offsets already recovered before a chunk was found to be truncated.
+func (ef *File) chunkEnvelopes(c Chunk, err error) (<-chan eventEnvelope, bool) {
+	if err != nil && err != io.EOF && !ef.truncatedRecovery {
+		panic(err)
+	}
+	if err != nil && len(c.EventOffsets) == 0 {
+		return nil, false
+	}
+	return c.parsedEvents(), true
 }
 
 // Close file

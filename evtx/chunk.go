@@ -99,6 +99,15 @@ type Chunk struct {
 	TemplateTable TemplateTable
 	EventOffsets  []int32
 	Data          []byte
+	// Carving makes parsing tolerant for a single chunk recovered from a
+	// dirty/truncated source. It is independent from the process-wide
+	// ModeCarving switch so OpenDirty can recover a chunk while ordinary
+	// opens keep their historical fail-fast behaviour.
+	Carving bool
+	// Deduper, when set, is the source-level identity frontier a structured
+	// chunk consumer must share with the File event streams. A nil value keeps
+	// Chunk.Events local to the chunk.
+	Deduper *RecordDeduper
 }
 
 // NewChunk initialize and returns a new Chunk structure
@@ -118,33 +127,47 @@ func (c *Chunk) ParseChunkHeader(reader io.ReadSeeker) {
 // Less implement datastructs.Sortable
 func (c Chunk) Less(s datastructs.Sortable) bool {
 	other := s.(Chunk)
-	return c.Header.NumFirstRecLog < other.Header.NumFirstRecLog
+	if c.Header.NumFirstRecLog != other.Header.NumFirstRecLog {
+		return c.Header.NumFirstRecLog < other.Header.NumFirstRecLog
+	}
+	return c.Offset < other.Offset
 }
 
 // ParseStringTable parses the string table located at the current offset in the
 // reader and modify the chunk object
 // @reader : reader object to parse string table from
 func (c *Chunk) ParseStringTable(reader io.ReadSeeker) {
+	if c.StringTable == nil {
+		c.StringTable = make(ChunkStringTable)
+	}
 	strOffset := int32(0)
 	for i := int64(0); i < sizeStringBucket*4; i += 4 {
-		encoding.Unmarshal(reader, &strOffset, Endianness)
+		if err := encoding.Unmarshal(reader, &strOffset, Endianness); err != nil {
+			// The string bucket itself is truncated. No string entry can be
+			// recovered from this point; the caller may still recover event
+			// offsets from the fixed table boundary.
+			return
+		}
 		if strOffset > 0 {
 			cs, err := StringAt(reader, int64(strOffset))
 			if err != nil {
-				if !ModeCarving {
+				if !ModeCarving && !c.Carving {
 					panic(err)
 				}
+				continue
 			}
 			c.StringTable[strOffset] = cs
 		}
 	}
-	return
 }
 
 // ParseTemplaTable parses the template table located at the current offset in
 // the reader passed as parameter and modifies the current Chunk object
 // @reader : reader object to parse string table from
 func (c *Chunk) ParseTemplateTable(reader io.ReadSeeker) error {
+	if c.TemplateTable == nil {
+		c.TemplateTable = make(TemplateTable)
+	}
 	templateDataOffset := int32(0)
 	for i := int32(0); i < sizeTemplateBucket*4; i = i + 4 {
 		//parse(buf, i, &tempOffsetTable[j])
@@ -190,7 +213,7 @@ func (c *Chunk) ParseEventOffsets(reader io.ReadSeeker) (err error) {
 		// Event Header is not valid
 		if err = eh.Validate(); err != nil {
 			// we bruteforce in carving mode
-			if ModeCarving {
+			if ModeCarving || c.Carving {
 				offsetEvent++
 				continue
 			}
@@ -207,7 +230,13 @@ func (c *Chunk) ParseEventOffsets(reader io.ReadSeeker) (err error) {
 // @offset : offset to parse the Event at
 // return Event : parsed Event
 func (c *Chunk) ParseEvent(offset int64) (e Event) {
-	if int64(c.Header.OffsetLastRec) < offset {
+	if offset < 0 || offset+EventHeaderSize > int64(len(c.Data)) {
+		return
+	}
+	// OffsetLastRec is the parser's upper bound. Manually constructed and
+	// truncated chunks may leave it zero; the Data bounds above are then the
+	// authoritative limit.
+	if c.Header.OffsetLastRec > 0 && int64(c.Header.OffsetLastRec) < offset {
 		return
 	}
 	reader := bytes.NewReader(c.Data)
@@ -241,18 +270,72 @@ func (c *Chunk) ParseEvent(offset int64) (e Event) {
 func (c *Chunk) Events() (cgem chan *GoEvtxMap) {
 	// Unbuffered Event channel
 	cgem = make(chan *GoEvtxMap, len(c.EventOffsets))
+	d := c.Deduper
+	if d == nil {
+		d = NewRecordDeduper("Chunk.Events")
+	}
 	go func() {
 		defer close(cgem)
-		for _, eo := range c.EventOffsets {
-			// for every event offset, we parsed the event at that position
-			event := c.ParseEvent(int64(eo))
-			gem, err := event.GoEvtxMap(c)
-			if err == nil {
-				cgem <- gem
+		for env := range c.parsedEvents() {
+			if _, ok := d.Admit(env); ok {
+				cgem <- env.gem
 			}
 		}
 	}()
 	return
+}
+
+// parsedEvents emits every successfully decoded event together with its
+// binary/source coordinates. File-level streams use the envelope so identity
+// decisions can be made across chunks and scans.
+func (c *Chunk) parsedEvents() <-chan eventEnvelope {
+	cec := make(chan eventEnvelope, len(c.EventOffsets))
+	go func() {
+		defer close(cec)
+		if c.TemplateTable == nil {
+			c.TemplateTable = make(TemplateTable)
+		}
+		for _, eo := range c.EventOffsets {
+			env, ok := c.parseEnvelope(int64(eo))
+			if !ok {
+				continue
+			}
+			env.annotate()
+			cec <- env
+		}
+	}()
+	return cec
+}
+
+// parseEnvelope parses one event offset and returns false when the record is
+// incomplete or cannot be decoded. Recovering a truncated chunk must publish
+// the complete records that precede the cut without letting a partial trailing
+// record panic the whole public event stream.
+func (c *Chunk) parseEnvelope(offset int64) (env eventEnvelope, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	event := c.ParseEvent(offset)
+	if event.Header.Validate() != nil {
+		return eventEnvelope{}, false
+	}
+	// A truncated trailing record has a valid-looking header but not enough
+	// bytes for its declared payload. Do not feed that partial record to the
+	// BinXML parser.
+	if offset+int64(event.Header.Size) > int64(len(c.Data)) {
+		return eventEnvelope{}, false
+	}
+	gem, err := event.GoEvtxMap(c)
+	if err != nil || gem == nil {
+		return eventEnvelope{}, false
+	}
+	return eventEnvelope{
+		event:       event,
+		gem:         gem,
+		chunkOffset: c.Offset,
+	}, true
 }
 
 func (c Chunk) String() string {
